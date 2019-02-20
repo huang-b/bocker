@@ -59,32 +59,44 @@ function bocker_ps() { #HELP List containers:\nBOCKER ps
 }
 
 function bocker_run() { #HELP Create a container:\nBOCKER run <image_id> <command>
+    # 生成uuid，在42002-42254范围内选一个,后三位可作为IP地址末位
 	uuid="ps_$(shuf -i 42002-42254 -n 1)"
 	[[ "$(bocker_check "$1")" == 1 ]] && echo "No image named '$1' exists" && exit 1
 	[[ "$(bocker_check "$uuid")" == 0 ]] && echo "UUID conflict, retrying..." && bocker_run "$@" && return
 	cmd="${@:2}" && ip="$(echo "${uuid: -3}" | sed 's/0//g')" && mac="${uuid: -3:1}:${uuid: -2}"
+    # 配置虚拟网卡，总是成对出现，用于连接两个netns或者netns与linuxbridge
 	ip link add dev veth0_"$uuid" type veth peer name veth1_"$uuid"
+    # veth0 工作在宿主机的netns，并连接到网桥
 	ip link set dev veth0_"$uuid" up
 	ip link set veth0_"$uuid" master bridge0
+    # 为容器创建netns，隔离容器虚拟网络与宿主机物理网络
 	ip netns add netns_"$uuid"
+    # veth1 工作在容器的netns
 	ip link set veth1_"$uuid" netns netns_"$uuid"
 	ip netns exec netns_"$uuid" ip link set dev lo up
+    # 为 veth1 配置 mac, ip 和路由
 	ip netns exec netns_"$uuid" ip link set veth1_"$uuid" address 02:42:ac:11:00"$mac"
 	ip netns exec netns_"$uuid" ip addr add 10.0.0."$ip"/24 dev veth1_"$uuid"
 	ip netns exec netns_"$uuid" ip link set dev veth1_"$uuid" up
 	ip netns exec netns_"$uuid" ip route add default via 10.0.0.1
+    # 从镜像创建容器，本质上是创建btrfs的cow快照 
 	btrfs subvolume snapshot "$btrfs_path/$1" "$btrfs_path/$uuid" > /dev/null
+    # 容器DNS
 	echo 'nameserver 8.8.8.8' > "$btrfs_path/$uuid"/etc/resolv.conf
+    # 容器需要执行的命令
 	echo "$cmd" > "$btrfs_path/$uuid/$uuid.cmd"
+    # 为容器创建 CGROUP，包括 CPU 权重和最大内存，默认值512，可通过环境变量修改
 	cgcreate -g "$cgroups:/$uuid"
 	: "${BOCKER_CPU_SHARE:=512}" && cgset -r cpu.shares="$BOCKER_CPU_SHARE" "$uuid"
 	: "${BOCKER_MEM_LIMIT:=512}" && cgset -r memory.limit_in_bytes="$((BOCKER_MEM_LIMIT * 1000000))" "$uuid"
+    # 在 CGROUP 内执行命令
 	cgexec -g "$cgroups:$uuid" \
 		ip netns exec netns_"$uuid" \
 		unshare -fmuip --mount-proc \
 		chroot "$btrfs_path/$uuid" \
 		/bin/sh -c "/bin/mount -t proc proc /proc && $cmd" \
 		2>&1 | tee "$btrfs_path/$uuid/$uuid.log" || true
+    # 删除虚拟网卡和 netns
 	ip link del dev veth0_"$uuid"
 	ip netns del netns_"$uuid"
 }
@@ -109,6 +121,7 @@ function bocker_commit() { #HELP Commit a container to an image:\nBOCKER commit 
 }
 
 function bocker_help() { #HELP Display this message:\nBOCKER help
+    # 打印帮助信息，信息从以HELP开头的注释中获取
 	sed -n "s/^.*#HELP\\s//p;" < "$1" | sed "s/\\\\n/\n\t/g;s/$/\n/;s!BOCKER!${1/!/\\!}!g"
 }
 
