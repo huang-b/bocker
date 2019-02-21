@@ -4,11 +4,14 @@ btrfs_path='/var/bocker' && cgroups='cpu,cpuacct,memory';
 [[ $# -gt 0 ]] && while [ "${1:0:2}" == '--' ]; do OPTION=${1:2}; [[ $OPTION =~ = ]] && declare "BOCKER_${OPTION/=*/}=${OPTION/*=/}" || declare "BOCKER_${OPTION}=x"; shift; done
 
 function bocker_check() {
+    # 检查包含 $1 关键字的容器或镜像是否存在，是返回0，否返回1
     btrfs subvolume list "$btrfs_path" | grep -qw "$1" && echo 0 || echo 1
 }
 
 function bocker_init() { #HELP Create an image from a directory:\nBOCKER init <directory>
+    # 生成镜像uuid
     uuid="img_$(shuf -i 42002-42254 -n 1)"
+    # 将指定目录的内容复制到新建的 btrfs 卷中，就得到了新的镜像
     if [[ -d "$1" ]]; then
         [[ "$(bocker_check "$uuid")" == 0 ]] && bocker_run "$@"
         btrfs subvolume create "$btrfs_path/$uuid" > /dev/null
@@ -20,22 +23,30 @@ function bocker_init() { #HELP Create an image from a directory:\nBOCKER init <d
     fi
 }
 
+# 在 Docker Hub 的架构将认证和存储解耦为 index 和 registry
+# pull 镜像要先通过 index 认证获取 token，然后凭 token 向 registry 获取镜像
 function bocker_pull() { #HELP Pull an image from Docker Hub:\nBOCKER pull <name> <tag>
+    # 向 index 获取认证 token
     token="$(curl -sL -o /dev/null -D- -H 'X-Docker-Token: true' "https://index.docker.io/v1/repositories/$1/images" | tr -d '\r' | awk -F ': *' '$1 == "X-Docker-Token" { print $2 }')"
     registry='https://registry-1.docker.io/v1'
+    # 向 registry 获取镜像 id
     id="$(curl -sL -H "Authorization: Token $token" "$registry/repositories/$1/tags/$2" | sed 's/"//g')"
     [[ "${#id}" -ne 64 ]] && echo "No image named '$1:$2' exists" && exit 1
+    # 向 registry 获取镜像的各个层次
     ancestry="$(curl -sL -H "Authorization: Token $token" "$registry/images/$id/ancestry")"
+    # 解压下载的 layer，保存到 /tmp/"$tmp_uuid" 目录下
     IFS=',' && ancestry=(${ancestry//[\[\] \"]/}) && IFS=' \n\t'; tmp_uuid="$(uuidgen)" && mkdir /tmp/"$tmp_uuid"
     for id in "${ancestry[@]}"; do
         curl -#L -H "Authorization: Token $token" "$registry/images/$id/layer" -o /tmp/"$tmp_uuid"/layer.tar
         tar xf /tmp/"$tmp_uuid"/layer.tar -C /tmp/"$tmp_uuid" && rm /tmp/"$tmp_uuid"/layer.tar
     done
     echo "$1:$2" > /tmp/"$tmp_uuid"/img.source
+    # 把 /tmp/"$tmp_uuid" 目录制作为镜像并删除目录
     bocker_init /tmp/"$tmp_uuid" && rm -rf /tmp/"$tmp_uuid"
 }
 
 function bocker_rm() { #HELP Delete an image or container:\nBOCKER rm <image_id or container_id>
+    # 删除对应的 btrfs 卷和 CGROUP
     [[ "$(bocker_check "$1")" == 1 ]] && echo "No container named '$1' exists" && exit 1
     btrfs subvolume delete "$btrfs_path/$1" > /dev/null
     cgdelete -g "$cgroups:/$1" &> /dev/null || true
@@ -43,6 +54,7 @@ function bocker_rm() { #HELP Delete an image or container:\nBOCKER rm <image_id 
 }
 
 function bocker_images() { #HELP List images:\nBOCKER images
+    # 匹配镜像的 btrfs 卷
     echo -e "IMAGE_ID\t\tSOURCE"
     for img in "$btrfs_path"/img_*; do
         img=$(basename "$img")
@@ -51,6 +63,7 @@ function bocker_images() { #HELP List images:\nBOCKER images
 }
 
 function bocker_ps() { #HELP List containers:\nBOCKER ps
+    # 匹配容器的 btrfs 卷
     echo -e "CONTAINER_ID\t\tCOMMAND"
     for ps in "$btrfs_path"/ps_*; do
         ps=$(basename "$ps")
@@ -58,10 +71,16 @@ function bocker_ps() { #HELP List containers:\nBOCKER ps
     done
 }
 
+# namespace 实现容器与宿主机的隔离
+# btrfs 提供容器运行的文件系统
+# cgroup 实现资源隔离
+# veth 和 linuxbridge 提供虚拟网络
+# cgexec 最终执行命令
 function bocker_run() { #HELP Create a container:\nBOCKER run <image_id> <command>
     # 生成uuid，在42002-42254范围内选一个,后三位可作为IP地址末位
     uuid="ps_$(shuf -i 42002-42254 -n 1)"
     [[ "$(bocker_check "$1")" == 1 ]] && echo "No image named '$1' exists" && exit 1
+    # uuid 冲突，重新 bocker_run
     [[ "$(bocker_check "$uuid")" == 0 ]] && echo "UUID conflict, retrying..." && bocker_run "$@" && return
     cmd="${@:2}" && ip="$(echo "${uuid: -3}" | sed 's/0//g')" && mac="${uuid: -3:1}:${uuid: -2}"
     # 配置虚拟网卡，总是成对出现，用于连接两个netns或者netns与linuxbridge
@@ -79,7 +98,7 @@ function bocker_run() { #HELP Create a container:\nBOCKER run <image_id> <comman
     ip netns exec netns_"$uuid" ip addr add 10.0.0."$ip"/24 dev veth1_"$uuid"
     ip netns exec netns_"$uuid" ip link set dev veth1_"$uuid" up
     ip netns exec netns_"$uuid" ip route add default via 10.0.0.1
-    # 从镜像创建容器，本质上是创建btrfs的cow快照 
+    # 从镜像创建容器，本质上是创建 btrfs 的 COW 快照 
     btrfs subvolume snapshot "$btrfs_path/$1" "$btrfs_path/$uuid" > /dev/null
     # 容器DNS
     echo 'nameserver 8.8.8.8' > "$btrfs_path/$uuid"/etc/resolv.conf
@@ -89,7 +108,13 @@ function bocker_run() { #HELP Create a container:\nBOCKER run <image_id> <comman
     cgcreate -g "$cgroups:/$uuid"
     : "${BOCKER_CPU_SHARE:=512}" && cgset -r cpu.shares="$BOCKER_CPU_SHARE" "$uuid"
     : "${BOCKER_MEM_LIMIT:=512}" && cgset -r memory.limit_in_bytes="$((BOCKER_MEM_LIMIT * 1000000))" "$uuid"
-    # 在 CGROUP 内执行命令
+    # cgexec 在指定 CGROUP 内执行命令
+    # - ip netns exec 在指定 netns 内执行命令
+    # -- unshare f(ork) 新的 m(ount), u(ts), i(pc), p(id) 命名空间以执行命令
+    # --- chroot 以相应的 btrfs 卷为根目录执行命令
+    # ---- /bin/sh 解析命令的二进制可执行文件
+    # 先挂载 proc 文件系统，再执行用户命令，stdout 和 stderr 合并输出
+    # tee 既输出到标准输出，又保存到文件 
     cgexec -g "$cgroups:$uuid" \
         ip netns exec netns_"$uuid" \
         unshare -fmuip --mount-proc \
@@ -103,17 +128,21 @@ function bocker_run() { #HELP Create a container:\nBOCKER run <image_id> <comman
 
 function bocker_exec() { #HELP Execute a command in a running container:\nBOCKER exec <container_id> <command>
     [[ "$(bocker_check "$1")" == 1 ]] && echo "No container named '$1' exists" && exit 1
+    # 获取容器 pid
     cid="$(ps o ppid,pid | grep "^$(ps o pid,cmd | grep -E "^\ *[0-9]+ unshare.*$1" | awk '{print $1}')" | awk '{print $2}')"
     [[ ! "$cid" =~ ^\ *[0-9]+$ ]] && echo "Container '$1' exists but is not running" && exit 1
+    # 进入容器命名空间以相应的 btrfs 卷为根文件系统执行命令
     nsenter -t "$cid" -m -u -i -n -p chroot "$btrfs_path/$1" "${@:2}"
 }
 
 function bocker_logs() { #HELP View logs from a container:\nBOCKER logs <container_id>
+    # 读取容器的 btrfs 卷中的日志文件
     [[ "$(bocker_check "$1")" == 1 ]] && echo "No container named '$1' exists" && exit 1
     cat "$btrfs_path/$1/$1.log"
 }
 
 function bocker_commit() { #HELP Commit a container to an image:\nBOCKER commit <container_id> <image_id>
+    # 为指定容器的 btrfs 卷创建快照以得到新镜像
     [[ "$(bocker_check "$1")" == 1 ]] && echo "No container named '$1' exists" && exit 1
     [[ "$(bocker_check "$2")" == 1 ]] && echo "No image named '$2' exists" && exit 1
     bocker_rm "$2" && btrfs subvolume snapshot "$btrfs_path/$1" "$btrfs_path/$2" > /dev/null
